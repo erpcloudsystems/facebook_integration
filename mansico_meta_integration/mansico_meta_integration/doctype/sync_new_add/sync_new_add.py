@@ -12,6 +12,128 @@ def get_credentials():
 
 import requests
 import json
+import re
+import hashlib
+
+
+# Max length for the generated fieldname. Frappe/MySQL column names are capped
+# at 64 chars and Frappe's Custom Field validator rejects names at that limit,
+# so we keep a small safety margin.
+_MAX_FIELDNAME_LEN = 60
+
+
+def _custom_fieldname_from_key(key):
+    """Build a safe Frappe fieldname for a Meta custom question key.
+
+    - Prefixes with `custom_` so the auto-created field is clearly namespaced.
+    - Replaces any non-alphanumeric character with `_`.
+    - Collapses repeated underscores and trims trailing ones.
+    - If the sanitized name is too long, truncates and appends a short hash
+      of the original key to keep the fieldname unique and reproducible.
+    """
+    if not key:
+        return None
+    safe = re.sub(r"[^0-9a-zA-Z]+", "_", str(key)).strip("_").lower()
+    if not safe:
+        return None
+    if not safe.startswith("custom_"):
+        safe = "custom_" + safe
+    if len(safe) > _MAX_FIELDNAME_LEN:
+        digest = hashlib.md5(str(key).encode("utf-8")).hexdigest()[:6]
+        safe = safe[: _MAX_FIELDNAME_LEN - 7].rstrip("_") + "_" + digest
+    return safe.rstrip("_")
+
+
+def _ensure_lead_custom_field(lead_doctype, fieldname, label, field_type=None):
+    """Create a Custom Field on the Lead doctype if it does not exist yet."""
+    if not fieldname:
+        return
+    if frappe.get_meta(lead_doctype).has_field(fieldname):
+        return
+    # Map Meta field types to Frappe fieldtypes; default to Data.
+    ft_map = {
+        "DATE_TIME": "Datetime",
+        "DATE": "Date",
+        "NUMBER": "Data",
+    }
+    fieldtype = ft_map.get(field_type, "Data")
+    try:
+        frappe.get_doc(
+            {
+                "doctype": "Custom Field",
+                "dt": lead_doctype,
+                "fieldname": fieldname,
+                "label": label or fieldname,
+                "fieldtype": fieldtype,
+                "insert_after": "custom_lead_json",
+            }
+        ).insert(ignore_permissions=True)
+    except frappe.DuplicateEntryError:
+        # Another process created it concurrently; ignore.
+        pass
+
+
+def _normalize_phone(value):
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    digit_map = str.maketrans(
+        {
+            "٠": "0",
+            "١": "1",
+            "٢": "2",
+            "٣": "3",
+            "٤": "4",
+            "٥": "5",
+            "٦": "6",
+            "٧": "7",
+            "٨": "8",
+            "٩": "9",
+            "۰": "0",
+            "۱": "1",
+            "۲": "2",
+            "۳": "3",
+            "۴": "4",
+            "۵": "5",
+            "۶": "6",
+            "۷": "7",
+            "۸": "8",
+            "۹": "9",
+        }
+    )
+    s = s.translate(digit_map)
+    s = re.sub(r"[\s\-\(\)\.]+", "", s)
+    if s.startswith("+"):
+        s = "+" + re.sub(r"\D", "", s[1:])
+    else:
+        s = re.sub(r"\D", "", s)
+    return s or None
+
+
+def _truncate_to_field_length(doctype, fieldname, value):
+    if value is None:
+        return None
+    if not fieldname:
+        return value
+    if not isinstance(value, str):
+        return value
+    v = frappe.utils.strip_html(value).strip()
+    df = frappe.get_meta(doctype).get_field(fieldname)
+    if not df:
+        return v
+    if df.fieldtype in ("Text", "Long Text", "Code"):
+        return v
+    max_len = df.length
+    if not max_len:
+        if df.fieldtype == "Small Text":
+            max_len = 255
+        elif df.fieldtype in ("Data", "Link", "Select", "Phone", "Email", "Dynamic Link"):
+            max_len = 140
+    if max_len and len(v) > max_len:
+        return v[:max_len]
+    return v
 
 
 class Request:
@@ -114,63 +236,80 @@ class AppendForms:
                     form_fields,
                 )
 
+    # Mapping from Meta question "type" to a standard ERPNext Lead field.
+    STANDARD_TYPE_TO_LEAD_FIELD = {
+        "EMAIL": "email_id",
+        "FULL_NAME": "first_name",
+        "FIRST_NAME": "first_name",
+        "LAST_NAME": "last_name",
+        "PHONE": "mobile_no",
+        "PHONE_NUMBER": "mobile_no",
+        "WORK_PHONE_NUMBER": "phone",
+        "JOB_TITLE": "job_title",
+        "COMPANY_NAME": "company_name",
+        "CITY": "city",
+        "COUNTRY": "country",
+        "STATE": "state",
+    }
+
+    KEY_TO_LEAD_FIELD = {
+        "full_name": "first_name",
+        "fullname": "first_name",
+        "fullname_ar": "first_name",
+        "name": "first_name",
+        "phone": "mobile_no",
+        "mobile": "mobile_no",
+        "mobile_no": "mobile_no",
+        "work_phone_number": "phone",
+        "work_phone": "phone",
+        "email": "email_id",
+        "email_id": "email_id",
+    }
+
     def set_map_lead_fields(self, questions, form_fields):
         for question in questions:
-            if (
-                question.get("key") not in form_fields
-            ):  # Check if the key is not already in the list
-                if question.get("type") == "EMAIL":
-                    self.doc.append(
-                        "map_lead_fields",
-                        {
-                            "lead_field": "email_id",
-                            "form_field": question.get("key"),
-                            "form_field_label": question.get("label"),
-                            "form_field_type": question.get("type"),
-                        },
-                    )
-                elif question.get("type") == "FULL_NAME":
-                    self.doc.append(
-                        "map_lead_fields",
-                        {
-                            "lead_field": "first_name",
-                            "form_field": question.get("key"),
-                            "form_field_label": question.get("label"),
-                            "form_field_type": question.get("type"),
-                        },
-                    )
-                elif question.get("type") == "PHONE":
-                    self.doc.append(
-                        "map_lead_fields",
-                        {
-                            "lead_field": "phone_number",
-                            "form_field": question.get("key"),
-                            "form_field_label": question.get("label"),
-                            "form_field_type": question.get("type"),
-                        },
-                    )
-                elif question.get("type") == "CUSTOM":
-                    self.doc.append(
-                        "map_lead_fields",
-                        {
-                            "lead_field": question.get("key"),
-                            "form_field": question.get("key"),
-                            "form_field_label": question.get("label"),
-                            "form_field_type": question.get("type"),
-                        },
-                    )
-                else:
-                    self.doc.append(
-                        "map_lead_fields",
-                        {
-                            "lead_field": question.get("key"),
-                            "form_field": question.get("key"),
-                            "form_field_label": question.get("label"),
-                            "form_field_type": question.get("type"),
-                        },
-                    )
-                # Add the key to form_fields to avoid duplicating it
-                form_fields.append(question.get("key"))
+            key = question.get("key")
+            qtype = question.get("type")
+            if key in form_fields:
+                continue
+
+            # Normalize key (Meta can send keys like "full name").
+            key_norm = re.sub(r"[^0-9a-zA-Z]+", "_", str(key or "")).strip("_").lower()
+
+            # Pick a target Lead field:
+            # - Known Meta types -> standard Lead field.
+            # - Anything else (CUSTOM, unknown) -> sanitized custom_<key>
+            #   so it maps onto an auto-created Custom Field on Lead.
+            standard_field = self.KEY_TO_LEAD_FIELD.get(key_norm) or self.STANDARD_TYPE_TO_LEAD_FIELD.get(qtype)
+            if standard_field:
+                lead_field = standard_field
+            else:
+                lead_field = _custom_fieldname_from_key(key)
+                # Skip questions whose key cannot be turned into a valid
+                # Frappe fieldname (empty/invalid key). Otherwise the child
+                # row would be created without a `lead_field` and fail the
+                # mandatory validation on `Map Lead Field`.
+                if not lead_field:
+                    continue
+                # Make sure the target Custom Field exists on the Lead doctype
+                # before we try to write to it later during lead creation.
+                _ensure_lead_custom_field(
+                    self.doc.lead_doctype_name,
+                    lead_field,
+                    question.get("label"),
+                    qtype,
+                )
+
+            self.doc.append(
+                "map_lead_fields",
+                {
+                    "lead_field": lead_field,
+                    "form_field": key,
+                    "form_field_label": question.get("label"),
+                    "form_field_type": qtype,
+                },
+            )
+            form_fields.append(key)
 
 
 class ServerScript:
@@ -316,7 +455,15 @@ class FetchLeads:
                 for mapping in self.doc.map_lead_fields:
                     if mapping.get("form_field") == field_name:
                         # Dynamically map field_data to the Lead fields based on map_lead_fields
-                        lead_data[mapping.get("lead_field")] = field_value
+                        target_field = mapping.get("lead_field")
+                        if target_field in ("phone", "mobile_no"):
+                            field_value = _normalize_phone(field_value)
+                            if not field_value:
+                                continue
+                        field_value = _truncate_to_field_length(
+                            self.doc.lead_doctype_name, target_field, field_value
+                        )
+                        lead_data[target_field] = field_value
 
             if lead.get("id") and not frappe.db.exists(
                 self.doc.lead_doctype_name, {"custom_meta_lead_id": lead.get("id")}
@@ -333,13 +480,29 @@ class FetchLeads:
                     for field_name, field_value in lead_data.items():
                         new_lead_data[field_name] = field_value
 
-                    new_lead = frappe.get_doc(new_lead_data)
-                    new_lead.insert(ignore_permissions=True)
+                    try:
+                        new_lead = frappe.get_doc(new_lead_data)
+                        new_lead.insert(ignore_permissions=True)
+                    except frappe.DuplicateEntryError as dup_err:
+                        # Duplicate Contact name (ERPNext auto-creates Contact from Lead).
+                        # Rollback and retry while bypassing auto-Contact creation.
+                        frappe.db.rollback()
+                        from erpnext.crm.doctype.lead.lead import Lead as _ERPLead
+                        _orig = _ERPLead.create_contact
+                        _ERPLead.create_contact = lambda self: None
+                        try:
+                            new_lead = frappe.get_doc(new_lead_data)
+                            new_lead.insert(ignore_permissions=True)
+                        finally:
+                            _ERPLead.create_contact = _orig
+                    frappe.db.commit()
 
                     # Optionally, create the lead in Facebook
                     FetchLeads.create_lead_in_facebook(new_lead, self.page)
 
                 except Exception as e:
+                    # Rollback failed transaction to release locks
+                    frappe.db.rollback()
                     # Log errors and traceback for better debugging
                     frappe.log_error("Error in Lead Creation", str(e))
                     frappe.log_error("Traceback", str(traceback.format_exc()))
@@ -407,8 +570,48 @@ class FetchLeads:
             note.insert(ignore_permissions=True)
 
 
+@frappe.whitelist()
+def trigger_fetch_leads(name):
+    fetch = FetchLeads(name)
+    fetch.fetch_leads()
+    return {"form_ids": fetch.form_ids}
+
+
+@frappe.whitelist()
+def regenerate_map_lead_fields(name):
+    """Rebuild `map_lead_fields` for an existing Sync New Add doc using the
+    currently-stored Meta forms (`table_hsya`), without re-calling Meta API.
+
+    This also auto-creates any missing Custom Fields on the Lead doctype.
+    """
+    doc = frappe.get_doc("Sync New Add", name)
+    # Clear existing rows
+    doc.set("map_lead_fields", [])
+    form_fields = []
+    appender = AppendForms(lead_forms=None, doc=doc)
+    for lead_form_row in doc.table_hsya:
+        questions_val = lead_form_row.questions
+        if isinstance(questions_val, str):
+            questions = json.loads(questions_val).get("questions")
+        else:
+            questions = (questions_val or {}).get("questions")
+        if not questions:
+            continue
+        appender.set_map_lead_fields(questions, form_fields)
+    # Persist without calling the Meta API again.
+    doc.flags.skip_meta_fetch = True
+    doc.save(ignore_permissions=True)
+    return {"rows": len(doc.map_lead_fields)}
+
+
 class SyncNewAdd(Document):
+    def after_insert(self):
+        if getattr(self, "fetch_map_lead_fields", 0) and getattr(self, "table_hsya", None):
+            regenerate_map_lead_fields(self.name)
+
     def validate(self):
+        if getattr(self.flags, "skip_meta_fetch", False):
+            return
         defaults = get_credentials()
         #  init Request
         request = Request(
