@@ -333,9 +333,7 @@ class ServerScript:
 
         _script += """from mansico_meta_integration.mansico_meta_integration.doctype.sync_new_add.sync_new_add import FetchLeads\n"""
         _script += """import frappe\n"""
-        _script += """fetch = FetchLeads("{0}")\n""".format(
-            str(str(self.doc.name).replace("-", "_")).lower()
-        )
+        _script += """fetch = FetchLeads("{0}")\n""".format(self.doc.name)
         _script += """fetch.fetch_leads()\n"""
         return _script
 
@@ -696,16 +694,14 @@ class SyncNewAdd(Document):
     def on_submit(self):
         self.check_meta_fields_found()
         self.check_email_id()
-        # i want to check if site hase enable_schedule = 1
-        # create Server Script
-        # server_script = ServerScript(self)
-        # server_script.create_server_script()
-        # server_script.server_script.insert(ignore_permissions=True)
-        # frappe.db.commit()
-        # frappe.msgprint("Server Script Created Successfully")
+        server_script = ServerScript(self)
+        server_script.create_server_script()
+        server_script.server_script.insert(ignore_permissions=True)
+        frappe.db.commit()
+        frappe.msgprint("Server Script Created Successfully")
 
     def on_cancel(self):
-        pass
-        # delete Server Script
-        # frappe.delete_doc("Server Script", str(self.name).lower().replace("-","_"), ignore_permissions=True)
-        # frappe.msgprint("Server Script Deleted Successfully")
+        script_name = str(self.name).lower().replace("-", "_")
+        if frappe.db.exists("Server Script", script_name):
+            frappe.delete_doc("Server Script", script_name, ignore_permissions=True)
+            frappe.msgprint("Server Script Deleted Successfully")

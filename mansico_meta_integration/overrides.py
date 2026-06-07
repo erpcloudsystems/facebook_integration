@@ -13,12 +13,11 @@ def _validate_lead_status_change(doc, doctype):
     """
     Helper function to validate status change and trigger Facebook lead creation.
     """
-    if is_scheduler_disabled():
-        frappe.throw(_("Please enable the Scheduler first."))
-
     if not doc.is_new() and doc.custom_meta_lead_id:
         old_doc = doc.get_doc_before_save()
         if old_doc and old_doc.status != doc.status:
+            if is_scheduler_disabled():
+                frappe.throw(_("Please enable the Scheduler first."))
             try:
                 lead = frappe.get_doc(doctype, doc.name)
                 FetchLeads.create_lead_in_facebook(lead)
