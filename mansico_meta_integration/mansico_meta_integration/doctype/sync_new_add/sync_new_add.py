@@ -144,11 +144,20 @@ def _truncate_to_field_length(doctype, fieldname, value):
 
 def _parse_fb_datetime(value):
     """Convert a Facebook `created_time` string (e.g. 2026-08-11T09:20:24+0000)
-    into a value the Datetime fieldtype accepts. Returns None on any parse failure."""
+    into a value the Datetime fieldtype accepts. Returns None on any parse failure.
+
+    `frappe.utils.get_datetime` returns a timezone-aware datetime when the
+    input string carries a UTC offset, but MySQL's DATETIME column rejects a
+    value with a timezone suffix (e.g. "2026-08-12 13:08:18+00:00") - so the
+    tzinfo is dropped, keeping the UTC wall-clock time as-is.
+    """
     if not value:
         return None
     try:
-        return frappe.utils.get_datetime(value)
+        dt = frappe.utils.get_datetime(value)
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return None
 
