@@ -44,12 +44,31 @@ def _custom_fieldname_from_key(key):
     return safe.rstrip("_")
 
 
-def _ensure_lead_custom_field(lead_doctype, fieldname, label, field_type=None):
-    """Create a Custom Field on the Lead doctype if it does not exist yet."""
+def _ensure_custom_field(doctype, fieldname, label, fieldtype="Data", options=None, insert_after=None):
+    """Create a Custom Field on `doctype` if it does not exist yet."""
     if not fieldname:
         return
-    if frappe.get_meta(lead_doctype).has_field(fieldname):
+    if frappe.get_meta(doctype).has_field(fieldname):
         return
+    try:
+        frappe.get_doc(
+            {
+                "doctype": "Custom Field",
+                "dt": doctype,
+                "fieldname": fieldname,
+                "label": label or fieldname,
+                "fieldtype": fieldtype,
+                "options": options,
+                "insert_after": insert_after,
+            }
+        ).insert(ignore_permissions=True)
+    except frappe.DuplicateEntryError:
+        # Another process created it concurrently; ignore.
+        pass
+
+
+def _ensure_lead_custom_field(lead_doctype, fieldname, label, field_type=None):
+    """Create a Custom Field on the Lead doctype if it does not exist yet."""
     # Map Meta field types to Frappe fieldtypes; default to Data.
     ft_map = {
         "DATE_TIME": "Datetime",
@@ -57,20 +76,7 @@ def _ensure_lead_custom_field(lead_doctype, fieldname, label, field_type=None):
         "NUMBER": "Data",
     }
     fieldtype = ft_map.get(field_type, "Data")
-    try:
-        frappe.get_doc(
-            {
-                "doctype": "Custom Field",
-                "dt": lead_doctype,
-                "fieldname": fieldname,
-                "label": label or fieldname,
-                "fieldtype": fieldtype,
-                "insert_after": "custom_lead_json",
-            }
-        ).insert(ignore_permissions=True)
-    except frappe.DuplicateEntryError:
-        # Another process created it concurrently; ignore.
-        pass
+    _ensure_custom_field(lead_doctype, fieldname, label, fieldtype=fieldtype, insert_after="custom_lead_json")
 
 
 def _normalize_phone(value):
@@ -134,6 +140,93 @@ def _truncate_to_field_length(doctype, fieldname, value):
     if max_len and len(v) > max_len:
         return v[:max_len]
     return v
+
+
+def _parse_fb_datetime(value):
+    """Convert a Facebook `created_time` string (e.g. 2026-08-11T09:20:24+0000)
+    into a value the Datetime fieldtype accepts. Returns None on any parse failure."""
+    if not value:
+        return None
+    try:
+        return frappe.utils.get_datetime(value)
+    except Exception:
+        return None
+
+
+def _find_existing_lead_by_phone(doctype, phone):
+    """Find an existing Lead/CRM Lead already carrying this normalized phone
+    number, checking both `mobile_no` and `phone`. Used to avoid creating a
+    duplicate record when the same person submits a lead form more than once.
+    """
+    if not phone:
+        return None
+    return (
+        frappe.db.get_value(doctype, {"mobile_no": phone}, "name")
+        or frappe.db.get_value(doctype, {"phone": phone}, "name")
+    )
+
+
+def _get_post_permalink(post_id, access_token, api_url, graph_api_version):
+    """Look up the real Facebook post permalink for a lead's `post` id.
+
+    Returns None (rather than raising) on any failure so a Graph API hiccup
+    never blocks Lead creation - callers should treat a None url as "unknown".
+    """
+    if not post_id or not access_token:
+        return None
+    try:
+        response = requests.get(
+            "{0}/v{1}/{2}".format(api_url, graph_api_version, post_id),
+            params={"fields": "permalink_url", "access_token": access_token},
+        )
+        data = response.json()
+        permalink = frappe._dict(data).get("permalink_url")
+        if permalink and permalink.startswith("/"):
+            permalink = "https://www.facebook.com" + permalink
+        return permalink
+    except Exception:
+        frappe.log_error("Error fetching FB post permalink", frappe.get_traceback())
+        return None
+
+
+def _get_or_create_campaign(campaign_id, campaign_name, permalink):
+    """Find (or create) the Campaign matching a Facebook `campaign_id`.
+
+    Campaigns are matched via the dedicated `custom_meta_campaign_id` field
+    rather than by name, since Facebook campaign names aren't guaranteed
+    unique and can be renamed after the fact.
+    """
+    if not campaign_id:
+        return None
+    _ensure_custom_field(
+        "Campaign",
+        "custom_meta_campaign_id",
+        "Meta Campaign ID",
+        insert_after="custom_source",
+    )
+    existing = frappe.db.get_value("Campaign", {"custom_meta_campaign_id": campaign_id}, "name")
+    if existing:
+        return existing
+    try:
+        campaign = frappe.get_doc(
+            {
+                "doctype": "Campaign",
+                "campaign_name": _truncate_to_field_length(
+                    "Campaign", "campaign_name", campaign_name or campaign_id
+                ),
+                "custom_meta_campaign_id": campaign_id,
+                # Lead Source "Campaign" marks campaigns created via this Meta integration.
+                "custom_source": "Campaign",
+                "custom_url": permalink,
+            }
+        )
+        campaign.insert(ignore_permissions=True)
+        return campaign.name
+    except frappe.DuplicateEntryError:
+        return frappe.db.get_value("Campaign", {"custom_meta_campaign_id": campaign_id}, "name")
+    except Exception:
+        frappe.log_error("Error creating Campaign from FB lead", frappe.get_traceback())
+        return None
 
 
 class Request:
@@ -399,6 +492,8 @@ class FetchLeads:
             request_page_access_token = RequestPageAccessToken(request)
             # get page access token
             request_page_access_token.get_page_access_token()
+            self.page_access_token = request_page_access_token.page_access_token
+            self.defaults = defaults
             # init Request
             request = Request(
                 defaults.api_url,
@@ -463,48 +558,97 @@ class FetchLeads:
                         )
                         lead_data[target_field] = field_value
 
-            if lead.get("id") and not frappe.db.exists(
+            if not lead.get("id") or frappe.db.exists(
                 self.doc.lead_doctype_name, {"custom_meta_lead_id": lead.get("id")}
             ):
-                try:
-                    # Create a new Lead document dynamically based on available fields
-                    new_lead_data = {
-                        "doctype": self.doc.lead_doctype_name,
-                        "custom_meta_lead_id": lead.get("id"),
-                        "custom_lead_json": frappe._dict(lead),
+                continue
+
+            try:
+                # Resolve the Facebook post permalink and matching Campaign, and
+                # build the Source and Campaign row for this lead event - shared
+                # by both the "new Lead" and the "existing Lead" paths below.
+                source_campaign_row = None
+                if frappe.get_meta(self.doc.lead_doctype_name).has_field("custom_source_and_campaign"):
+                    post = lead.get("post")
+                    post_id = post.get("id") if isinstance(post, dict) else post
+                    permalink = _get_post_permalink(
+                        post_id,
+                        getattr(self, "page_access_token", None),
+                        getattr(self, "defaults", frappe._dict()).get("api_url"),
+                        getattr(self, "defaults", frappe._dict()).get("graph_api_version"),
+                    )
+                    campaign_doc_name = _get_or_create_campaign(
+                        lead.get("campaign_id"), lead.get("campaign_name"), permalink
+                    )
+
+                    source_campaign_row = {
+                        "source": "Campaign",
+                        "url": permalink,
+                        "campaign_name": lead.get("campaign_name"),
+                        "adset_name": lead.get("adset_name"),
+                        "ad_name": lead.get("ad_name"),
+                        "date": _parse_fb_datetime(lead.get("created_time")),
                     }
+                    if campaign_doc_name:
+                        source_campaign_row["campaign"] = campaign_doc_name
 
-                    # Dynamically populate lead fields from lead_data
+                # If a Lead/CRM Lead already exists with this phone number, update
+                # its data in place and just append a new Source and Campaign row,
+                # instead of creating a duplicate record for the same person.
+                phone_value = lead_data.get("mobile_no") or lead_data.get("phone")
+                existing_name = _find_existing_lead_by_phone(self.doc.lead_doctype_name, phone_value)
+
+                if existing_name:
+                    existing_lead = frappe.get_doc(self.doc.lead_doctype_name, existing_name)
                     for field_name, field_value in lead_data.items():
-                        new_lead_data[field_name] = field_value
+                        existing_lead.set(field_name, field_value)
+                    if source_campaign_row:
+                        existing_lead.append("custom_source_and_campaign", source_campaign_row)
+                    existing_lead.save(ignore_permissions=True)
+                    frappe.db.commit()
+                    continue
 
+                # Create a new Lead document dynamically based on available fields
+                new_lead_data = {
+                    "doctype": self.doc.lead_doctype_name,
+                    "custom_meta_lead_id": lead.get("id"),
+                    "custom_lead_json": frappe._dict(lead),
+                }
+
+                # Dynamically populate lead fields from lead_data
+                for field_name, field_value in lead_data.items():
+                    new_lead_data[field_name] = field_value
+
+                if source_campaign_row:
+                    new_lead_data["custom_source_and_campaign"] = [source_campaign_row]
+
+                try:
+                    new_lead = frappe.get_doc(new_lead_data)
+                    new_lead.insert(ignore_permissions=True)
+                except frappe.DuplicateEntryError as dup_err:
+                    # Duplicate Contact name (ERPNext auto-creates Contact from Lead).
+                    # Rollback and retry while bypassing auto-Contact creation.
+                    frappe.db.rollback()
+                    from erpnext.crm.doctype.lead.lead import Lead as _ERPLead
+                    _orig = _ERPLead.create_contact
+                    _ERPLead.create_contact = lambda self: None
                     try:
                         new_lead = frappe.get_doc(new_lead_data)
                         new_lead.insert(ignore_permissions=True)
-                    except frappe.DuplicateEntryError as dup_err:
-                        # Duplicate Contact name (ERPNext auto-creates Contact from Lead).
-                        # Rollback and retry while bypassing auto-Contact creation.
-                        frappe.db.rollback()
-                        from erpnext.crm.doctype.lead.lead import Lead as _ERPLead
-                        _orig = _ERPLead.create_contact
-                        _ERPLead.create_contact = lambda self: None
-                        try:
-                            new_lead = frappe.get_doc(new_lead_data)
-                            new_lead.insert(ignore_permissions=True)
-                        finally:
-                            _ERPLead.create_contact = _orig
-                    frappe.db.commit()
+                    finally:
+                        _ERPLead.create_contact = _orig
+                frappe.db.commit()
 
-                    # Optionally, create the lead in Facebook
-                    FetchLeads.create_lead_in_facebook(new_lead, self.page)
+                # Optionally, create the lead in Facebook
+                FetchLeads.create_lead_in_facebook(new_lead, self.page)
 
-                except Exception as e:
-                    # Rollback failed transaction to release locks
-                    frappe.db.rollback()
-                    # Log errors and traceback for better debugging
-                    frappe.log_error("Error in Lead Creation", str(e))
-                    frappe.log_error("Traceback", str(traceback.format_exc()))
-                    frappe.log_error("Lead Data", str(lead_data))
+            except Exception as e:
+                # Rollback failed transaction to release locks
+                frappe.db.rollback()
+                # Log errors and traceback for better debugging
+                frappe.log_error("Error in Lead Creation", str(e))
+                frappe.log_error("Traceback", str(traceback.format_exc()))
+                frappe.log_error("Lead Data", str(lead_data))
 
     @staticmethod
     def create_lead_in_facebook(lead, page):
