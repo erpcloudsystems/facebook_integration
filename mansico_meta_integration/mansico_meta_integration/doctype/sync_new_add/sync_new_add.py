@@ -162,6 +162,19 @@ def _parse_fb_datetime(value):
         return None
 
 
+def _has_matching_source_campaign_date(existing_lead, date_value):
+    """Whether `existing_lead` already carries a Source and Campaign row for
+    this exact `date`. A Facebook lead's `created_time` is fixed per original
+    submission, so a repeat of that same date means this specific lead event
+    was already synced onto this record - used to skip the update/append
+    entirely instead of re-saving on every fetch run.
+    """
+    if not date_value:
+        return False
+    rows = existing_lead.get("custom_source_and_campaign") or []
+    return any(row.get("date") == date_value for row in rows)
+
+
 def _find_existing_lead_by_phone(doctype, phone):
     """Find an existing Lead/CRM Lead already carrying this normalized phone
     number, checking both `mobile_no` and `phone`. Used to avoid creating a
@@ -609,6 +622,15 @@ class FetchLeads:
 
                 if existing_name:
                     existing_lead = frappe.get_doc(self.doc.lead_doctype_name, existing_name)
+
+                    # This exact Facebook lead event (same `date`) was already
+                    # recorded on this Lead before - skip entirely instead of
+                    # updating/appending again for data we've already synced.
+                    if source_campaign_row and _has_matching_source_campaign_date(
+                        existing_lead, source_campaign_row.get("date")
+                    ):
+                        continue
+
                     for field_name, field_value in lead_data.items():
                         existing_lead.set(field_name, field_value)
                     if source_campaign_row:
