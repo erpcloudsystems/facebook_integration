@@ -7,11 +7,40 @@ from mansico_meta_integration.mansico_meta_integration.doctype.sync_new_add.sync
 
 
 def validate_lead(doc, method=None):
+    _dedupe_source_and_campaign(doc)
     _enqueue_lead_status_change(doc, "Lead")
 
 
 def validate_crmlead(doc, method=None):
+    _dedupe_source_and_campaign(doc)
     _enqueue_lead_status_change(doc, "CRM Lead")
+
+
+def _dedupe_source_and_campaign(doc):
+    """Collapse duplicate `custom_source_and_campaign` rows that share the same
+    `date`, keeping only the first.
+
+    A Facebook lead's `created_time` (stored in `date`) is fixed per original
+    submission. `fetch_leads` re-fetches a form's entire history on every run
+    with no "since" cursor, so any bug that reprocesses an already-seen lead
+    (or a stale record from before that guard existed) produces rows with an
+    identical `date` - this also self-heals any record already bloated by such
+    duplicates the next time it's saved.
+    """
+    rows = doc.get("custom_source_and_campaign")
+    if not rows:
+        return
+    seen_dates = set()
+    keep = []
+    for row in rows:
+        date_value = row.get("date")
+        if date_value:
+            if date_value in seen_dates:
+                continue
+            seen_dates.add(date_value)
+        keep.append(row)
+    if len(keep) != len(rows):
+        doc.set("custom_source_and_campaign", keep)
 
 
 def _enqueue_lead_status_change(doc, doctype):
