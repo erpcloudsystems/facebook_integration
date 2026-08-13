@@ -168,11 +168,20 @@ def _has_matching_source_campaign_date(existing_lead, date_value):
     submission, so a repeat of that same date means this specific lead event
     was already synced onto this record - used to skip the update/append
     entirely instead of re-saving on every fetch run.
+
+    Rows loaded via `frappe.get_doc` have `date` cast to a `datetime.datetime`
+    object, while a freshly built row still holds the plain string from
+    `_parse_fb_datetime` - both sides are normalized through `get_datetime`
+    before comparing so the check doesn't silently miss on a type mismatch.
     """
     if not date_value:
         return False
+    target = frappe.utils.get_datetime(date_value)
     rows = existing_lead.get("custom_source_and_campaign") or []
-    return any(row.get("date") == date_value for row in rows)
+    return any(
+        row.get("date") and frappe.utils.get_datetime(row.get("date")) == target
+        for row in rows
+    )
 
 
 def _find_existing_lead_by_phone(doctype, phone):
@@ -248,6 +257,28 @@ def _get_or_create_campaign(campaign_id, campaign_name, permalink):
         return frappe.db.get_value("Campaign", {"custom_meta_campaign_id": campaign_id}, "name")
     except Exception:
         frappe.log_error("Error creating Campaign from FB lead", frappe.get_traceback())
+        return None
+
+
+def _get_or_create_named_campaign(name):
+    """Find (or create) a Campaign record matching this exact `campaign_name` -
+    used as a simple platform-level tag (e.g. "Facebook") for leads where Meta
+    doesn't return a specific ad `campaign_id`/`campaign_name` (which, in
+    practice, is most of them).
+    """
+    if not name:
+        return None
+    existing = frappe.db.get_value("Campaign", {"campaign_name": name}, "name")
+    if existing:
+        return existing
+    try:
+        campaign = frappe.get_doc({"doctype": "Campaign", "campaign_name": name})
+        campaign.insert(ignore_permissions=True)
+        return campaign.name
+    except frappe.DuplicateEntryError:
+        return frappe.db.get_value("Campaign", {"campaign_name": name}, "name")
+    except Exception:
+        frappe.log_error(f"Error creating Campaign '{name}'", frappe.get_traceback())
         return None
 
 
@@ -602,6 +633,8 @@ class FetchLeads:
                     campaign_doc_name = _get_or_create_campaign(
                         lead.get("campaign_id"), lead.get("campaign_name"), permalink
                     )
+                    if not campaign_doc_name and lead.get("platform") == "fb":
+                        campaign_doc_name = _get_or_create_named_campaign("Facebook")
 
                     source_campaign_row = {
                         "source": "Campaign",
