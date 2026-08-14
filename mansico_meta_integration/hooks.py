@@ -22,18 +22,18 @@ doc_events["CRM Lead"] = {
 
 scheduler_events = {
 	"all": [
-		"mansico_meta_integration.tasks.all"
+		"mansico_meta_integration.tasks.fetch_all_leads"
 	],
 	"daily": [
-		"mansico_meta_integration.tasks.daily"
+		"mansico_meta_integration.tasks.fetch_daily_leads"
 	],
 	"hourly": [
-		"mansico_meta_integration.tasks.hourly"
+		"mansico_meta_integration.tasks.fetch_hourly_leads"
 	],
 	"weekly": [
-		"mansico_meta_integration.tasks.weekly"
+		"mansico_meta_integration.tasks.fetch_weekly_leads"
 	],
 	"monthly": [
-		"mansico_meta_integration.tasks.monthly"
+		"mansico_meta_integration.tasks.fetch_monthly_leads"
 	],
 }

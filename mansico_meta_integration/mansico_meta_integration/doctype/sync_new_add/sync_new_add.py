@@ -260,6 +260,14 @@ def _get_or_create_campaign(campaign_id, campaign_name, permalink):
         return None
 
 
+# Meta's Lead object `platform` values, mapped to a simple campaign tag name.
+# Anything else (e.g. "an" for Audience Network) falls back to "Campaign".
+PLATFORM_CAMPAIGN_TAG = {
+    "fb": "Facebook",
+    "ig": "Instagram",
+}
+
+
 def _get_or_create_named_campaign(name):
     """Find (or create) a Campaign record matching this exact `campaign_name` -
     used as a simple platform-level tag (e.g. "Facebook") for leads where Meta
@@ -272,7 +280,14 @@ def _get_or_create_named_campaign(name):
     if existing:
         return existing
     try:
-        campaign = frappe.get_doc({"doctype": "Campaign", "campaign_name": name})
+        campaign = frappe.get_doc(
+            {
+                "doctype": "Campaign",
+                "campaign_name": name,
+                # Mandatory field; also marks this as Meta-integration-created.
+                "custom_source": "Campaign",
+            }
+        )
         campaign.insert(ignore_permissions=True)
         return campaign.name
     except frappe.DuplicateEntryError:
@@ -458,32 +473,6 @@ class AppendForms:
             form_fields.append(key)
 
 
-class ServerScript:
-    def __init__(self, doc):
-        self.doc = doc
-
-    def create_server_script(self):
-        self.server_script = frappe.get_doc(
-            {
-                "doctype": "Server Script",
-                "name": str(str(self.doc.name).replace("-", "_")).lower(),
-                "script_type": "Scheduler Event",
-                "event_frequency": self.doc.event_frequency,
-                "module": "Mansico Meta Integration",
-                "script": self.generate_script(),
-            }
-        )
-
-    def generate_script(self):
-        _script = ""
-
-        _script += """from mansico_meta_integration.mansico_meta_integration.doctype.sync_new_add.sync_new_add import FetchLeads\n"""
-        _script += """import frappe\n"""
-        _script += """fetch = FetchLeads("{0}")\n""".format(self.doc.name)
-        _script += """fetch.fetch_leads()\n"""
-        return _script
-
-
 class RequestSendLead:
     def __init__(self, request):
         self.request = request
@@ -527,6 +516,10 @@ class FetchLeads:
         self.doc = frappe.get_doc("Sync New Add", self.name)
         self.page = frappe.get_doc("Page ID", self.doc.page_id)
         self.form_ids = self.get_form_ids
+        # Meta's paginated `/leads` responses can repeat the same lead across
+        # pages (a known Graph API quirk) - tracked in-memory for this run so
+        # a same-batch repeat is caught even before its DB commit would be.
+        self._processed_meta_lead_ids = set()
         for form_id in self.form_ids:
             defaults = get_credentials()
             #  init Request
@@ -611,10 +604,12 @@ class FetchLeads:
                         )
                         lead_data[target_field] = field_value
 
-            if not lead.get("id") or frappe.db.exists(
-                self.doc.lead_doctype_name, {"custom_meta_lead_id": lead.get("id")}
+            lead_id = lead.get("id")
+            if not lead_id or lead_id in self._processed_meta_lead_ids or frappe.db.exists(
+                self.doc.lead_doctype_name, {"custom_meta_lead_id": lead_id}
             ):
                 continue
+            self._processed_meta_lead_ids.add(lead_id)
 
             try:
                 # Resolve the Facebook post permalink and matching Campaign, and
@@ -633,8 +628,10 @@ class FetchLeads:
                     campaign_doc_name = _get_or_create_campaign(
                         lead.get("campaign_id"), lead.get("campaign_name"), permalink
                     )
-                    if not campaign_doc_name and lead.get("platform") == "fb":
-                        campaign_doc_name = _get_or_create_named_campaign("Facebook")
+                    if not campaign_doc_name:
+                        platform_tag = PLATFORM_CAMPAIGN_TAG.get(lead.get("platform"))
+                        if platform_tag:
+                            campaign_doc_name = _get_or_create_named_campaign(platform_tag)
 
                     source_campaign_row = {
                         "source": "Campaign",
@@ -902,14 +899,8 @@ class SyncNewAdd(Document):
     def on_submit(self):
         self.check_meta_fields_found()
         self.check_email_id()
-        server_script = ServerScript(self)
-        server_script.create_server_script()
-        server_script.server_script.insert(ignore_permissions=True)
-        frappe.db.commit()
-        frappe.msgprint("Server Script Created Successfully")
-
-    def on_cancel(self):
-        script_name = str(self.name).lower().replace("-", "_")
-        if frappe.db.exists("Server Script", script_name):
-            frappe.delete_doc("Server Script", script_name, ignore_permissions=True)
-            frappe.msgprint("Server Script Deleted Successfully")
+        # Scheduling itself is handled by the app-wide scheduler hooks in
+        # tasks.py (mansico_meta_integration.tasks.all/hourly/daily/...),
+        # which pick up every submitted Sync New Add matching their
+        # frequency - no per-doc Server Script needed.
+        frappe.msgprint("Activated - leads will be synced automatically based on the Event Frequency.")

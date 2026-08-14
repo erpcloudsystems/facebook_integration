@@ -4,37 +4,29 @@ import frappe
 from mansico_meta_integration.mansico_meta_integration.doctype.sync_new_add.sync_new_add import FetchLeads
 
 
-@frappe.whitelist()
-def all():
-    sync_new_add = frappe.db.get_all("Sync New Add", {"event_frequency": "All", "docstatus": 1}, pluck="name")
+def _run(event_frequency):
+    sync_new_add = frappe.db.get_all("Sync New Add", {"event_frequency": event_frequency, "docstatus": 1}, pluck="name")
     for name in sync_new_add:
         fetch = FetchLeads(name)
         fetch.fetch_leads()
 
-@frappe.whitelist()
-def daily():
-    sync_new_add = frappe.db.get_all("Sync New Add", {"event_frequency": "Daily", "docstatus": 1}, pluck="name")
-    for name in sync_new_add:
-        fetch = FetchLeads(name)
-        fetch.fetch_leads()
 
 @frappe.whitelist()
-def hourly():
-    sync_new_add = frappe.db.get_all("Sync New Add", {"event_frequency": "Hourly", "docstatus": 1}, pluck="name")
-    for name in sync_new_add:
-        fetch = FetchLeads(name)
-        fetch.fetch_leads()
+def fetch_all_leads():
+    _run("All")
 
 @frappe.whitelist()
-def weekly():
-    sync_new_add = frappe.db.get_all("Sync New Add", {"event_frequency": "Weekly", "docstatus": 1}, pluck="name")
-    for name in sync_new_add:
-        fetch = FetchLeads(name)
-        fetch.fetch_leads()
+def fetch_daily_leads():
+    _run("Daily")
 
 @frappe.whitelist()
-def monthly():
-    sync_new_add = frappe.db.get_all("Sync New Add", {"event_frequency": "Monthly", "docstatus": 1}, pluck="name")
-    for name in sync_new_add:
-        fetch = FetchLeads(name)
-        fetch.fetch_leads()
+def fetch_hourly_leads():
+    _run("Hourly")
+
+@frappe.whitelist()
+def fetch_weekly_leads():
+    _run("Weekly")
+
+@frappe.whitelist()
+def fetch_monthly_leads():
+    _run("Monthly")
